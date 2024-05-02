@@ -11,6 +11,9 @@ from openap.prop import aircraft
 from skdecide.hub.domain.flight_planning.aircraft_performance.poll_schumann_utils import (
     pollschumann,
 )
+from skdecide.hub.domain.flight_planning.aircraft_performance.poll_schumann_utils.utils.aero import (
+    Pa_to_ft
+)
 from skdecide.hub.domain.flight_planning.aircraft_performance.poll_schumann_utils.engine_loader import (
     load_aircraft_engine_params,
 )
@@ -39,8 +42,8 @@ class AircraftPerformanceModel:
             values_current, delta_time, path_angle=path_angle
         )
 
-    def compute_crossover_altitude(self) -> float:
-        return self.perf_model.compute_crossover_altitude()
+    def compute_crossover_altitude(self, cas, mach) -> float:
+        return self.perf_model.compute_crossover_altitude(cas * kts, mach)
 
 
 # create OpenAP class that inherits from the base class
@@ -68,7 +71,7 @@ class OpenAP(AircraftPerformanceModel):
         return delta_time * ff
 
     def compute_crossover_altitude(self, cas, mach) -> float:
-        return crossover_alt(cas, mach)
+        return crossover_alt(cas, mach) / ft
 
 
 # create aircraft performance model based on Poll-Schumann model that inherits from the base class
@@ -89,5 +92,5 @@ class PollSchumannModel(AircraftPerformanceModel):
 
         return delta_time * ff
 
-    def compute_crossover_altitude(self) -> float:
-        return load_aircraft_engine_params(self.actype)["p_inf_co"]
+    def compute_crossover_altitude(self, cas, mach) -> float:
+        return Pa_to_ft(load_aircraft_engine_params(self.actype)["p_inf_co"])

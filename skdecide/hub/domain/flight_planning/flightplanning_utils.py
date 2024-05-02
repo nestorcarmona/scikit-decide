@@ -117,29 +117,15 @@ def plot_full(domain, trajectory: pd.DataFrame) -> Figure:
         label="skdecide",
     )
 
-    # add network
-    ax3.scatter(
-        [
-            network[x][x1][x2].lon
-            for x in range(len(network))
-            for x1 in range(len(network[x]))
-            for x2 in range(len(network[x][x1]))
-        ],
-        [
-            network[x][x1][x2].lat
-            for x in range(len(network))
-            for x1 in range(len(network[x]))
-            for x2 in range(len(network[x][x1]))
-        ],
-        transform=ccrs.Geodetic(),
-        s=0.1,
-    )
-
     ax3.legend()
+    total_fuel = np.round(trajectory["fuel"].sum(), 2)
+    total_time = trajectory["ts"].values[-1] - trajectory["ts"].values[0]
+
+    total_time = time.strftime("%H:%M:%S", time.gmtime(total_time))
 
     # add title to figure
     fig.suptitle(
-        f'Leg: {domain.origin} -> {domain.destination} \n A/C perf. model: {domain.perf_model_name}; Fuel: {np.round(trajectory["fuel"].sum(), 2)} Kg',
+        f'Leg: {domain.origin} -> {domain.destination} \n A/C perf. model: {domain.perf_model_name}; Fuel: {total_fuel} Kg; Time: {total_time}',
         fontsize=16,
     )
 
