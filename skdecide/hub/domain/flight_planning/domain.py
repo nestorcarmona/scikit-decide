@@ -4,18 +4,19 @@ from enum import Enum
 
 # data and math
 from math import asin, atan2, cos, radians, sin, sqrt
+import pandas as pd
+import numpy as np
+import networkx as nx
 
 # typing
-from typing import Any, Callable, Optional, Tuple, Union
+from typing import Any, Callable, Optional, Tuple, Union, Dict, List
 
 # plotting
 import matplotlib.pyplot as plt
-import numpy as np
-import pandas as pd
 
 # aircraft performance model
 from openap.extra.aero import bearing as aero_bearing
-from openap.extra.aero import distance, ft, kts, latlon, mach2tas
+from openap.extra.aero import distance, ft, kts, latlon, mach2tas, mach2cas, nm, mach2cas, cas2tas
 from openap.extra.nav import airport
 from openap.prop import aircraft
 from pygeodesy.ellipsoidalVincenty import LatLon
@@ -40,7 +41,7 @@ from skdecide.hub.domain.flight_planning.weather_interpolator.weather_tools.get_
 from skdecide.hub.domain.flight_planning.weather_interpolator.weather_tools.interpolator.GenericInterpolator import (
     GenericWindInterpolator,
 )
-from skdecide.hub.space.gym import EnumSpace, ListSpace, MultiDiscreteSpace
+from skdecide.hub.space.gym import EnumSpace, ListSpace, TupleSpace, DiscreteSpace
 from skdecide.utils import load_registered_solver
 
 try:
@@ -184,17 +185,18 @@ class State:
     """
 
     trajectory: pd.DataFrame
-    pos: Tuple[int, int, int]
+    id: Dict[str, float]
 
-    def __init__(self, trajectory, pos):
+    def __init__(self, trajectory, id):
         """Initialisation of a state
 
         Args:
             trajectory : Trajectory information of the flight
-            pos : Current position in the airways graph
+            id: Node id in the airway graph
         """
         self.trajectory = trajectory
-        self.pos = pos
+        self.id = id
+
         if trajectory is not None:
             self.mass = trajectory.iloc[-1]["mass"]
             self.alt = trajectory.iloc[-1]["alt"]
@@ -205,12 +207,11 @@ class State:
             self.time = None
 
     def __hash__(self):
-        # print(self.pos, self.mass, self.alt, self.time)
-        return hash((self.pos, int(self.mass), self.alt, int(self.time)))
+        return hash((self.id, int(self.mass), self.alt, int(self.time)))
 
     def __eq__(self, other):
         return (
-            self.pos == other.pos
+            self.id == other.id
             and int(self.mass) == int(other.mass)
             and self.alt == other.alt
             and int(self.time) == int(other.time)
@@ -218,7 +219,7 @@ class State:
 
     def __ne__(self, other):
         return (
-            self.pos != other.pos
+            self.id != other.id
             or int(self.mass) != int(other.mass)
             or self.alt != other.alt
             or int(self.time) != int(other.time)
@@ -226,7 +227,7 @@ class State:
 
     def __str__(self):
         return f"[{self.trajectory.iloc[-1]['ts']:.2f} \
-            {self.pos} \
+            {self.id} \
             {self.trajectory.iloc[-1]['alt']:.2f} \
             {self.trajectory.iloc[-1]['mass']:.2f}]"
 
@@ -236,9 +237,9 @@ class H_Action(Enum):
     Horizontal action that can be perform by the aircraft
     """
 
-    up = -1
+    left = -1
     straight = 0
-    down = 1
+    right = 1
 
 
 class V_Action(Enum):
@@ -269,7 +270,7 @@ class FlightPlanningDomain(
     Domain definition
     -----------------
 
-    The flight planning domain can be quickly defined as :
+    The flight planning domain can be quickly defined as:
 
     - An origin, as ICAO code of an airport,
     - A destination, as ICAO code of an airport,
@@ -279,26 +280,28 @@ class FlightPlanningDomain(
     -------------
 
     A three-dimensional airway graph of waypoints is created. The graph is following the great circle
-    which represents the shortest pass between the origin and the destination.
+    which represents the shortest path between the origin and the destination.
     The planner computes a plan by choosing waypoints in the graph, which are represented by 4-dimensionnal states.
-    There is 3 phases in the graph :
+    There are 3 phases in the graph:
 
-    - The climbing phase
-    - The cruise phase
-    - The descent phase
+    - The climbing phase: represented by a dictionnary of 3 values (below_10k_ft, from_10k_to_crossover, above_crossover) which are the CAS or Mach number.
+    - The cruise phase: represented by a dictionnary of 1 value (above_crossover) which is the Mach number.
+    - The descent phase: represented by a dictionnary of 3 values (below_10k_ft, from_10k_to_crossover, above_crossover) which are the CAS or Mach number.
+    
+    For the climbing and descent phases, a rate of climb and descent is also defined.
 
-    The flight planning domain allows to choose a number of forward, lateral and vertical waypoints in the graph.
-    It is also possible to choose different width (tiny, small, normal, large, xlarge) which will increase
+    The flight planning domain allows to choose a number of branches, which represent the lateral waypoints in the graph, 
+    and a number of steps for each phase. It is also possible to choose different width (tiny, small, normal, large, xlarge) which will increase
     or decrease the graph width.
 
     State representation
     --------------------
 
-    Here, the states are represented by 4 features :
+    Here, the states are represented by 4 features:
 
     - The position in the graph (x,y,z)
     - The aircraft mass, which can also represent the fuel consumption (integer)
-    - The altitude (integer)
+    - The altitude (float)
     - The time (seconds)
 
     Wind interpolation
@@ -330,7 +333,7 @@ class FlightPlanningDomain(
     - fuel, which computes the required fuel to get to the goal. It takes in consideration the local wind & speed of the aircraft.
     - time, which computes the required time to get to the goal. It takes in consideration the local wind & speed of the aircraft.
     - distance, wich computes the distance to the goal.
-    - lazy_fuel, which propagates the fuel consummed so far.
+    - lazy_fuel, which propagates the fuel consumed so far.
     - lazy_time, which propagates the time spent on the flight so far
     - None : we give a 0 cost value, which will transform the A* algorithm into a Dijkstra-like algorithm.
 
@@ -342,12 +345,12 @@ class FlightPlanningDomain(
     - OpenAP: the aircraft performance model is based on the OpenAP library.
     - Poll-Schumann: the aircraft performance model is based on Poll-Schumann equations as stated on the paper: "An estimation
     method for the fuel burn and other performance characteristics of civil transport aircraft in the cruise" by Poll and Schumann;
-    The Aernautical Journal, 2020.
+    The Aeronautical Journal, 2020.
 
     Optional features
     -----------------
 
-    The flight planning domain has several optional features :
+    The flight planning domain has several optional features:
 
     - Fuel loop: this is an optimisation of the loaded fuel for the aircraft.
       It will run some flights to computes the loaded fuel, using distance objective & heuristic.
@@ -374,24 +377,26 @@ class FlightPlanningDomain(
         origin: Union[str, tuple],
         destination: Union[str, tuple],
         actype: str,
-        weather_date: WeatherDate = None,
-        wind_interpolator: GenericWindInterpolator = None,
+        weather_date: WeatherDate,
+        wind_interpolator: Optional[GenericWindInterpolator] = None,
         objective: str = "fuel",
         heuristic_name: str = "fuel",
         perf_model_name: str = "openap",
-        constraints=None,
-        nb_forward_points: int = 41,
-        nb_lateral_points: int = 11,
-        nb_vertical_points: int = None,
-        take_off_weight: int = None,
-        fuel_loaded: float = None,
+        constraints: Optional[Dict[str, float]] = None,
+        climb_profile: Dict[str, float] = {"below_10k_ft": 250., "from_10k_to_crossover": 270., "above_crossover": 0.78},
+        cruise_profile: Dict[str, float] = {"above_crossover": 0.83},
+        descent_profile: Dict[str, float] = {"below_10k_ft": 280., "from_10k_to_crossover": 280., "above_crossover": 0.8},
+        rate_of_climb_descent: Dict[str, float] = {"climb": 1_500.0, "descent": 2_000.0},
+        steps: Dict[str, int] = {"n_steps_climb": 5, "n_steps_cruise": 5, "n_steps_cruise_climb": 10, "n_steps_descent": 5},
+        n_branches: int = 3,
+        plane_heading: float = 0,
+        take_off_weight: Optional[int] = None,
+        fuel_loaded: Optional[float] = None,
         fuel_loop: bool = False,
         fuel_loop_solver_factory: Optional[Callable[[], Solver]] = None,
         fuel_loop_tol: float = 1e-3,
-        climbing_slope: float = None,
-        descending_slope: float = None,
-        graph_width: str = None,
-        res_img_dir: str = None,
+        graph_width: str = "medium",
+        res_img_dir: Optional[str] = None,
         starting_time: float = 3_600.0 * 8.0,
     ):
         """Initialisation of a flight planning instance
@@ -417,12 +422,20 @@ class FlightPlanningDomain(
                 Aircraft performance model used in the flight plan. It can be either openap or PS (Poll-Schumann). Defaults to "openap".
             constraints (_type_, optional):
                 Constraints dictionnary (keyValues : ['time', 'fuel'] ) to be defined in for the flight plan. Defaults to None.
-            nb_points_forward (int, optional):
-                Number of forward nodes in the graph. Defaults to 41.
-            nb_points_lateral (int, optional):
-                Number of lateral nodes in the graph. Defaults to 11.
-            nb_points_vertical (int, optional):
-                Number of vertical nodes in the graph. Defaults to None.
+            climb_profile (Dict[str, float], optional):
+                Climbing profile of the aircraft. Defaults to {"below_10k_ft": 250., "from_10k_to_crossover": 270., "above_crossover": 0.78}.
+            cruise_profile (Dict[str, float], optional):
+                Cruise profile of the aircraft. Defaults to {"above_crossover": 0.83}.
+            descent_profile (Dict[str, float], optional):
+                Descent profile of the aircraft. Defaults to {"below_10k_ft": 280., "from_10k_to_crossover": 280., "above_crossover": 0.8}.
+            rate_of_climb_descent (Dict[str, float], optional):
+                Rate of climb and descent of the aircraft. Defaults to {"climb": 1_500.0, "descent": 2_000.0}.
+            steps (Dict[str, int], optional):
+                Number of steps for each phase of the flight plan. Defaults to {"n_steps_climb": 5, "n_steps_cruise": 5, "n_steps_cruise_climb": 10, "n_steps_descent": 5}.
+            n_branches (int, optional):
+                Number of branches in the graph. Defaults to 3.
+            plane_heading (float, optional):
+                Heading of the aircraft. Defaults to 0.
             take_off_weight (int, optional):
                 Take off weight of the aircraft. Defaults to None.
             fuel_loaded (float, optional):
@@ -431,12 +444,8 @@ class FlightPlanningDomain(
                 Boolean to create a fuel loop to optimize the fuel loaded for the flight. Defaults to False
             fuel_loop_solver_factory (solver factory, optional):
                 Solver factory used in the fuel loop. Defaults to LazyAstar.
-            climbing_slope (float, optional):
-                Climbing slope of the aircraft, has to be between 10.0 and 25.0. Defaults to None.
-            descending_slope (float, optional):
-                Descending slope of the aircraft, has to be between 10.0 and 25.0. Defaults to None.
             graph_width (str, optional):
-                Airways graph width, in ["tiny", "small", "normal", "large", "xlarge"]. Defaults to None
+                Airways graph width, in ["small", "medium", "large", "xlarge"]. Defaults to medium
             res_img_dir (str, optional):
                 Directory in which images will be saved. Defaults to None
             starting_time (float, optional):
@@ -447,13 +456,13 @@ class FlightPlanningDomain(
         self.origin, self.destination = origin, destination
         if isinstance(origin, str):  # Origin is an airport
             ap1 = airport(origin)
-            self.lat1, self.lon1, self.alt1 = ap1["lat"], ap1["lon"], ap1["alt"]
+            self.lat1, self.lon1, self.alt1 = ap1["lat"], ap1["lon"], ap1["alt"] # type: ignore
         else:  # Origin is geographic coordinates
             self.lat1, self.lon1, self.alt1 = origin
 
         if isinstance(destination, str):  # Destination is an airport
             ap2 = airport(destination)
-            self.lat2, self.lon2, self.alt2 = ap2["lat"], ap2["lon"], ap2["alt"]
+            self.lat2, self.lon2, self.alt2 = ap2["lat"], ap2["lon"], ap2["alt"] # type: ignore
         else:  # Destination is geographic coordinates
             self.lat2, self.lon2, self.alt2 = destination
 
@@ -461,8 +470,6 @@ class FlightPlanningDomain(
         # Retrieve the aircraft datas in openap library
         self.actype = actype
         self.ac = aircraft(actype)
-
-        self.mach = self.ac["cruise"]["mach"]
 
         # Initialisation of the objective & heuristic, the constraints and the wind interpolator
         if heuristic_name in (
@@ -489,37 +496,32 @@ class FlightPlanningDomain(
         if wind_interpolator is None:
             self.weather_interpolator = self.get_weather_interpolator()
 
-        # Build network between airports
-        if graph_width:
-            all_graph_width = {
-                "tiny": 0.5,
-                "small": 0.75,
-                "normal": 1.0,
-                "large": 1.5,
-                "xlarge": 2.0,
-            }
-            graph_width = all_graph_width[graph_width]
-        else:
-            graph_width = 1.0
+        # Initialisation of the aircraft performance model
+        self.perf_model = AircraftPerformanceModel(actype, perf_model_name)
+        self.perf_model_name = perf_model_name
+        
+        # Initialisation of the flight phases and the graph
+        self.alt_crossover = self.perf_model.compute_crossover_altitude(climb_profile["from_10k_to_crossover"], climb_profile["above_crossover"])
+        self.climb_profile = climb_profile
+        self.cruise_profile = cruise_profile
+        self.descent_profile = descent_profile
 
-        self.nb_forward_points = nb_forward_points
-        self.nb_lateral_points = nb_lateral_points
-
-        if nb_vertical_points:
-            self.nb_vertical_points = nb_vertical_points
-        else:
-            self.nb_vertical_points = (
-                int((self.ac["limits"]["ceiling"] - self.ac["cruise"]["height"]) / 1000)
-                + 1
-            )
+        p0 = LatLon(self.lat1, self.lon1, self.alt1 * ft)
+        p1 = LatLon(self.lat2, self.lon2, self.alt2 * ft)
+        # TODO: remove this line
+        plane_heading = aero_bearing(self.lat1, self.lon1, self.lat2, self.lon2)
         self.network = self.set_network(
-            LatLon(self.lat1, self.lon1, self.alt1 * ft),  # alt ft -> meters
-            LatLon(self.lat2, self.lon2, self.alt2 * ft),  # alt ft -> meters
-            self.nb_forward_points,
-            self.nb_lateral_points,
-            self.nb_vertical_points,
-            descending_slope=descending_slope,
-            climbing_slope=climbing_slope,
+            p0=p0,  # alt ft -> meters
+            p1=p1,  # alt ft -> meters
+            climb_profile=self.climb_profile,
+            cruise_profile=self.cruise_profile,
+            descent_profile=self.descent_profile,
+            rate_of_climb_descent=rate_of_climb_descent,
+            plane_heading=plane_heading,
+
+            steps=steps,
+            n_branches=n_branches,
+
             graph_width=graph_width,
         )
 
@@ -559,7 +561,7 @@ class FlightPlanningDomain(
         aircraft_params = load_aircraft_engine_params(actype)
 
         self.start = State(
-            pd.DataFrame(
+            trajectory=pd.DataFrame(
                 [
                     {
                         "ts": self.start_time,
@@ -572,23 +574,17 @@ class FlightPlanningDomain(
                         * (
                             self.ac["limits"]["MFC"] - self.fuel_loaded
                         ),  # Here we compute the weight difference between the fuel loaded and the fuel capacity
-                        "mach": self.mach,
+                        "cas_mach": climb_profile["below_10k_ft"],
                         "fuel": 0.0,
                         "alt": self.alt1,
                     }
                 ]
             ),
-            (0, self.nb_lateral_points // 2, 0),
-        )
-
-        self.perf_model = AircraftPerformanceModel(actype, perf_model_name)
-        self.perf_model_name = perf_model_name
+            id=0)
 
         self.res_img_dir = res_img_dir
-        self.cruising = self.alt1 * ft >= self.ac["cruise"]["height"] * 0.98
 
     # Class functions
-
     def _get_next_state(self, memory: D.T_state, action: D.T_event) -> D.T_state:
         """Compute the next state
 
@@ -602,46 +598,58 @@ class FlightPlanningDomain(
 
         trajectory = memory.trajectory.copy()
 
-        # Set intermediate destination point
-        next_x, next_y, next_z = memory.pos
+        # Get current node information
+        current_node_id = memory.id
+        current_height = self.network.nodes[current_node_id]["height"]
+        current_phase = self.network.nodes[current_node_id]["phase"]
+        current_branch_id = self.network.nodes[current_node_id]["branch_id"]
 
-        next_x += 1
+        # Get successors information
+        node_successors = list(self.network.successors(current_node_id))
+        successors_heights = np.array([self.network.nodes[node_id]["height"] for node_id in node_successors])
+        successors_branch_ids = np.array([self.network.nodes[node_id]["branch_id"] for node_id in node_successors])
 
-        if action[0] == H_Action.up:
-            next_y += 1
-        if action[0] == H_Action.down:
-            next_y -= 1
-        if action[1] == V_Action.climb:
-            next_z += 1
-        if action[1] == V_Action.descent:
-            next_z -= 1
+        # Horizontal actions
+        if action[0] == H_Action.straight:
+            index_headings = np.where(successors_branch_ids == current_branch_id)[0]
+        elif action[0] == H_Action.right:
+            index_headings = np.where(successors_branch_ids > current_branch_id)[0]
+        elif action[0] == H_Action.left:
+            index_headings = np.where(successors_branch_ids < current_branch_id)[0]
 
-        # Aircraft stays on the network
-        if (
-            next_x >= self.nb_forward_points
-            or next_y < 0
-            or next_y >= self.nb_lateral_points
-            or next_z < 0
-            or next_z >= self.nb_vertical_points
-        ):
+        # Vertical actions
+        if action[1] == V_Action.cruise:
+            index_heights = np.where(successors_heights == current_height)[0]
+        elif action[1] == V_Action.climb:
+            index_heights = np.where(successors_heights > current_height)[0]
+        elif action[1] == V_Action.descent:
+            index_heights = np.where(successors_heights < current_height)[0]
+
+        if len(index_headings) == 0 or len(index_heights) == 0:
             return memory
 
-        # Concatenate the two trajectories
+        # Compute the intersection of the indexes to get the next node to reach
+        index = np.intersect1d(index_headings, index_heights)
 
-        to_lat = self.network[next_x][next_y][next_z].lat
-        to_lon = self.network[next_x][next_y][next_z].lon
-        to_alt = (
-            self.network[next_x][next_y][next_z].height / ft
-        )  # We compute the flight with altitude in ft, whereas the altitude in the network is in meters according to LatLon
+        if len(index) == 0:
+            print("There seem to be an issue with the index intersection.")
+            return memory
+        else:
+            index = index[0]
 
-        self.cruising = (
-            to_alt * ft >= self.ac["cruise"]["height"] * 0.98
-        )  # Check if the plane will be cruising in the next state
-        trajectory = self.flying(trajectory.tail(1), (to_lat, to_lon, to_alt))
+        # Get the next node information
+        next_node = node_successors[index]
+        to_lat = self.network.nodes[next_node]["lat"]
+        to_lon = self.network.nodes[next_node]["lon"]
+        to_alt = self.network.nodes[next_node]["height"] / ft
 
+        # Compute the next trajectory
+        trajectory = self.flying(trajectory.tail(1), (to_lat, to_lon, to_alt), current_phase)
+
+        # Update the next state
         state = State(
             pd.concat([memory.trajectory, trajectory], ignore_index=True),
-            (next_x, next_y, next_z),
+            next_node,
         )
         return state
 
@@ -649,7 +657,7 @@ class FlightPlanningDomain(
         self,
         memory: D.T_state,
         action: D.T_event,
-        next_state: Optional[D.T_state] = None,
+        next_state: D.T_state,
     ) -> Value[D.T_value]:
         """
         Get the value (reward or cost) of a transition.
@@ -702,7 +710,7 @@ class FlightPlanningDomain(
 
         Set the end position as goal.
         """
-        return ImplicitSpace(lambda x: x.pos[0] == self.nb_forward_points - 1)
+        return ImplicitSpace(lambda x: len(list(self.network.successors(x.id))) == 0)
 
     def _get_terminal_state_time_fuel(self, state: State) -> dict:
         """
@@ -726,40 +734,50 @@ class FlightPlanningDomain(
             time = state.trajectory.iloc[-1]["ts"] - self.start_time
 
         return {"time": time, "fuel": fuel}
-
+    
     def _is_terminal(self, state: State) -> D.T_predicate:
         """
         Indicate whether a state is terminal.
 
         Stop an episode only when goal reached.
         """
-        return state.pos[0] == self.nb_forward_points - 1
+        current_node_id = state.id
+        # The state is terminal if it does not have any successors
+        return  len(list(self.network.successors(current_node_id))) == 0
 
     def _get_applicable_actions_from(self, memory: D.T_state) -> Space[D.T_event]:
         """
         Get the applicable actions from a state.
         """
-        x, y, z = memory.pos
+        # Get current node information
+        current_node_id = memory.id
+        current_height = self.network.nodes[current_node_id]["height"]
+        current_branch_id = self.network.nodes[current_node_id]["branch_id"]
+
+        # Get successors information
+        node_successors = list(self.network.successors(current_node_id))
+        successors_heights = np.array([self.network.nodes[node_id]["height"] for node_id in node_successors])
+        successors_branch_ids = np.array([self.network.nodes[node_id]["branch_id"] for node_id in node_successors])
+
+        # V_Action
+        index_climb = (np.where(successors_heights > current_height)[0], V_Action.climb)
+        index_descend = (np.where(successors_heights < current_height)[0], V_Action.descent)
+        index_cruise = (np.where(successors_heights == current_height)[0], V_Action.cruise)
+
+        # H_Action
+        index_straight = (np.where(successors_branch_ids == current_branch_id)[0], H_Action.straight)
+        index_down = (np.where(successors_branch_ids < current_branch_id)[0], H_Action.left)
+        index_up = (np.where(successors_branch_ids > current_branch_id)[0], H_Action.right)
 
         space = []
-        if x < self.nb_forward_points - 1:
-            space.append((H_Action.straight, V_Action.cruise))
-            if z < self.nb_vertical_points - 1 and self.cruising:
-                space.append((H_Action.straight, V_Action.climb))
-            if z > 0 and self.cruising:
-                space.append((H_Action.straight, V_Action.descent))
-            if y + 1 < self.nb_lateral_points:
-                space.append((H_Action.up, V_Action.cruise))
-                if z < self.nb_vertical_points - 1 and self.cruising:
-                    space.append((H_Action.up, V_Action.climb))
-                if z > 0 and self.cruising:
-                    space.append((H_Action.up, V_Action.descent))
-            if y > 0:
-                space.append((H_Action.down, V_Action.cruise))
-                if z < self.nb_vertical_points - 1 and self.cruising:
-                    space.append((H_Action.down, V_Action.climb))
-                if z > 0 and self.cruising:
-                    space.append((H_Action.down, V_Action.descent))
+
+        for v_actions in [index_climb, index_descend, index_cruise]:
+            for h_actions in [index_straight, index_down, index_up]:
+                if len(v_actions[0]) > 0 and len(h_actions[0]) > 0:
+                    # Compute intersection of the indexes
+                    index = np.intersect1d(v_actions[0], h_actions[0])
+                    if len(index) > 0:
+                        space.append((h_actions[1], v_actions[1]))
 
         return ListSpace(space)
 
@@ -767,15 +785,16 @@ class FlightPlanningDomain(
         """
         Define action space.
         """
-        return EnumSpace((H_Action, V_Action))
+        return EnumSpace((H_Action, V_Action)) # type: ignore
 
     def _get_observation_space_(self) -> Space[D.T_observation]:
         """
         Define observation space.
         """
-        return MultiDiscreteSpace(
-            [self.nb_forward_points, self.nb_lateral_points, self.nb_vertical_points]
-        )
+        return TupleSpace((
+                DiscreteSpace(self.network.number_of_nodes()), # type: ignore
+                DiscreteSpace(self.network.number_of_edges()))
+            ) 
 
     def _render_from(self, memory: State, **kwargs: Any) -> Any:
         """
@@ -792,7 +811,7 @@ class FlightPlanningDomain(
             memory.trajectory,
         )
 
-    def heuristic(self, s: D.T_state, heuristic_name: str = None) -> Value[D.T_value]:
+    def heuristic(self, s: D.T_state, heuristic_name: Optional[str] = None) -> Value[D.T_value]:
         """
         Heuristic to be used by search algorithms, depending on the objective and constraints.
 
@@ -804,12 +823,35 @@ class FlightPlanningDomain(
             Value[D.T_value]: Heuristic value of the state.
         """
 
-        # current position
+        # Current position
         pos = s.trajectory.iloc[-1]
+        pos_alt = pos["alt"]
+        pos_phase = self.network.nodes[s.id]["phase"]
 
-        # parameters
+        # Parameters
         lat_to, lon_to, alt_to = self.lat2, self.lon2, self.alt2
         lat_start, lon_start, alt_start = self.lat1, self.lon1, self.alt1
+
+        cas = None
+        mach = None
+
+        # Determine current CAS/MACH
+        if pos_phase == "climb":
+            if pos_alt < 10_000:
+                cas = min(self.climb_profile["below_10k_ft"], 250) * kts
+            elif pos_alt < self.alt_crossover:
+                cas = self.climb_profile["from_10k_to_crossover"] * kts
+            else:
+                mach = self.climb_profile["above_crossover"]
+        elif pos_phase == "cruise":
+            mach = self.cruise_profile["above_crossover"]
+        elif pos_phase == "descent":
+            if pos_alt < 10_000:
+                cas = self.descent_profile["below_10k_ft"] * kts
+            elif pos_alt < self.alt_crossover:
+                cas = self.descent_profile["from_10k_to_crossover"] * kts
+            else:
+                mach = self.descent_profile["above_crossover"]
 
         if heuristic_name is None:
             heuristic_name = self.heuristic_name
@@ -839,7 +881,7 @@ class FlightPlanningDomain(
                 wind_ms = self.weather_interpolator.interpol_wind_classic(
                     lat=pos["lat"], longi=pos["lon"], alt=pos["alt"], t=pos["ts"]
                 )
-                we, wn = wind_ms[2][0], wind_ms[2][1]  # 0, 300
+                we, wn = wind_ms[2][0], wind_ms[2][1]
 
                 # temperature computations
                 temp = self.weather_interpolator.interpol_field(
@@ -852,7 +894,10 @@ class FlightPlanningDomain(
 
             wspd = sqrt(wn * wn + we * we)
 
-            tas = mach2tas(pos["mach"], pos["alt"] * ft)  # alt ft -> meters
+            if mach is not None:
+                tas = mach2tas(mach, alt_to * ft)  # alt ft -> meters
+            else:
+                tas = cas2tas(cas, alt_to * ft)  # alt ft -> meters
 
             gs = compute_gspeed(
                 tas=tas,
@@ -902,7 +947,10 @@ class FlightPlanningDomain(
                 we, wn = wind_ms[2][0], wind_ms[2][1]  # 0, 300
             wspd = sqrt(wn * wn + we * we)
 
-            tas = mach2tas(pos["mach"], pos["alt"] * ft)  # alt ft -> meters
+            if mach is not None:
+                tas = mach2tas(mach, alt_to * ft)  # alt ft -> meters
+            else:
+                tas = cas2tas(cas, alt_to * ft)  # alt ft -> meters
 
             gs = compute_gspeed(
                 tas=tas,
@@ -937,12 +985,18 @@ class FlightPlanningDomain(
         self,
         p0: LatLon,
         p1: LatLon,
-        nb_forward_points: int,
-        nb_lateral_points: int,
-        nb_vertical_points: int,
-        climbing_slope: float = None,
-        descending_slope: float = None,
-        graph_width: float = None,
+
+        climb_profile: Dict[str, float],
+        cruise_profile: Dict[str, float],
+        descent_profile: Dict[str, float],
+        rate_of_climb_descent: Dict[str, float],
+        
+        steps: Dict[str, int],
+        n_branches: int,
+
+        plane_heading: float,
+
+        graph_width: str = "medium",
     ):
         """
         Creation of the airway graph.
@@ -950,364 +1004,589 @@ class FlightPlanningDomain(
         Args:
             p0 : Origin of the flight plan
             p1 : Destination of the flight plan
-            nb_forward_points (int): Number of forward points in the graph
-            nb_lateral_points (int): Number of lateral points in the graph
-            nb_vertical_points (int): Number of vertical points in the graph
-            climbing_slope (float, optional): Climbing slope of the plane during climbing phase. Defaults to None.
-            descending_slope (float, optional):  Descent slope of the plane during descent phase. Defaults to None.
-            graph_width (float, optional): Graph width of the graph. Defaults to None.
+            climb_profile: (Dict[str, float]): Climb profile of the aircraft in Kts (and Mach where applicable)
+            cruise_profile: (float): Cruise profile of the aircraft in Kts (and Mach where applicable)
+            descent_profile: (Dict[str, float]): Descent profile of the aircraft in Kts (and Mach where applicable)
+            rate_of_climb_descent: (Dict[str, float]): Rate of climb and descent of the aircraft in ft/min
+            steps: (Dict[str, float]): Number of steps for each phase of the flight plan
+            n_branches: (int): Number of branches in the graph
+            plane_heading: (float): Initial heading of the aircraft
+            graph_width (str): Graph width of the graph. Defaults to medium
 
         Returns:
             A 3D matrix containing for each points its latitude, longitude, altitude between origin & destination.
         """
 
-        cruise_alt_min = 31_000 * ft  # maybe useful to change this
-        half_forward_points = nb_forward_points // 2
-        half_lateral_points = nb_lateral_points // 2
-        half_vertical_points = nb_vertical_points // 2
+        # COORDINATES
+        lon_start, lat_start = p0.lon, p0.lat
+        lon_end, lat_end = p1.lon, p1.lat
 
-        distp = (
-            graph_width * p0.distanceTo(p1) * 0.022
-        )  # meters, around 2.2%*graphwidth of the p0 to p1 distance
+        print(f"lat_start: {lat_start}, lon_start: {lon_start}; lat_end: {lat_end}, lon_end: {lon_end}")
 
-        descent_dist = min(
-            300_000
-            * (
-                max(self.ac["cruise"]["height"] - p1.height, 0)
-                / self.ac["cruise"]["height"]
-            ),
-            p0.distanceTo(p1),
-        )  # meters
+        # CLIMB, DESCENT: rocd (in ft/min)
+        rocd_climb = rate_of_climb_descent["climb"]
+        rocd_descent = rate_of_climb_descent["descent"]
 
-        climb_dist = 220_000 * (
-            max(self.ac["cruise"]["height"] - p0.height, 0)
-            / self.ac["cruise"]["height"]
-        )  # meters
+        # CLIMB: cas (in m/s) and mach
+        cas_climb1 = min(climb_profile["below_10k_ft"], 250) * kts # min(cas, 250) * kts # kts => m/s, cas from 6k to 10k ft
+        cas_climb2 = climb_profile["from_10k_to_crossover"] * kts # cas_climb2 * kts # kts => m/s, cas from 10k to crossover
+        mach_climb = climb_profile["above_crossover"] # self.ac["cruise"]["mach"] # above crossover
 
-        total_distance = p0.distanceTo(p1)
-        if total_distance < (climb_dist + descent_dist):
-            climb_dist = total_distance * max(
-                (climb_dist / (climb_dist + descent_dist)) - 0.1, 0
-            )
-            descent_dist = total_distance * max(
-                descent_dist / (climb_dist + descent_dist) - 0.1, 0
-            )
-            possible_altitudes = [cruise_alt_min for k in range(nb_vertical_points)]
+        # DESCENT: cas (in m/s) and mach
+        cas_descent1 = min(descent_profile["below_10k_ft"], 220) * kts # min(cas_descent1, 220) * kts # kts => m/s, cas from 3k to 6k ft
+        cas_descent2 = min(descent_profile["below_10k_ft"], 250) * kts # min(cas_descent1, 250) * kts # kts => m/s, cas from 6k to 10k ft
+        cas_descent3 = descent_profile["from_10k_to_crossover"] * kts # cas_descent3 * kts # kts => m/s, cas from 10k to crossover ft
+        mach_descent = descent_profile["above_crossover"] # self.ac["cruise"]["mach"] # above crossover
 
+        # CRUISE: mach
+        mach_cruise = cruise_profile["above_crossover"] # mach_cruise
+        assert mach_cruise < 1, "Mach number should be less than 1"
+
+        # ALTITUDES
+        alt_init = p0.height
+        alt_toc = self.ac["cruise"]["height"] # from OpenAP
+        alt_max = self.ac["limits"]["ceiling"] # from OpenAP
+        alt_final = p1.height
+        self.alt_crossover
+        print(f"alt_crossover: {self.alt_crossover}")
+
+        # HEADING, BEARING and DISTANCE
+        total_distance = distance(lat_start, lon_start, lat_end, lon_end, h=int(alt_final - alt_init))
+        half_distance = 3 * total_distance / 4
+
+        # initialize an empty graph
+        graph = nx.DiGraph()
+
+        # first node is the origin
+        graph.add_node(
+            0, 
+            node_id=0, 
+            parent_id=-1, 
+            branch_id=0, 
+            lat=lat_start, 
+            lon=lon_start, 
+            height=alt_init, 
+            heading=plane_heading,
+            dist_destination=total_distance,
+            dist_travelled=0,
+            ts=0,
+            phase="climb")
+
+        # define the width of the graph
+        if graph_width == "small":
+            alpha = 10
+        elif graph_width == "medium":
+            alpha = 30
+        elif graph_width == "large":
+            alpha = 45
+        elif graph_width == "xlarge":
+            alpha = 60
         else:
-            possible_altitudes = [
-                (
-                    min(
-                        self.ac["cruise"]["height"]
-                        + 2000 * ft * i
-                        - (self.ac["cruise"]["height"] % 1000),
-                        self.ac["limits"]["ceiling"],
-                    )
-                )
-                for i in range(nb_vertical_points)
-            ]
-        if climbing_slope:
-            climbing_ratio = climbing_slope
-        else:
-            climbing_ratio = (
-                possible_altitudes[0] / climb_dist if climb_dist != 0 else 0
-            )
-        if descending_slope:
-            descending_ratio = descending_slope
-        else:
-            descending_ratio = (
-                possible_altitudes[0] / descent_dist if descent_dist != 0 else 0
-            )
-        # Initialisation of the graph matrix
-        pt = [
-            [
-                [None for k in range(len(possible_altitudes))]
-                for j in range(nb_lateral_points)
-            ]
-            for i in range(nb_forward_points)
-        ]
+            raise ValueError("Graph width not defined or incorrect.")
+        
+        angles = np.linspace(start=-alpha, stop=alpha, num=n_branches-1, endpoint=True, dtype=float)
+        angles = np.sort(np.unique(np.append(angles, [0])))
+        
+        ########################################################################################################
+        ######################### FLIGHT PHASES SETUP ##########################################################
 
-        # set boundaries
-        for j in range(nb_lateral_points):
-            for k in range(nb_vertical_points):
-                pt[0][j][k] = p0
-                pt[nb_forward_points - 1][j][k] = p1
+        # CLIMB
+        n_steps_climb = steps["n_steps_climb"]
+        imposed_altitudes_climb = np.array([alt_init / ft, 10_000, self.alt_crossover, alt_toc / ft])
+        possible_altitudes_climb = np.linspace(alt_init, alt_toc, num=n_steps_climb, endpoint=True) / ft
+        possible_altitudes_climb = np.unique(np.sort(np.append(possible_altitudes_climb, imposed_altitudes_climb)))
+        time_steps_climb = np.diff(possible_altitudes_climb) / rocd_climb * 60 # seconds
 
-        # set climb phase
-        i_initial = 1
-        if climbing_ratio != 0:
-            dist = 0
-            alt = p0.height
-            while dist < climb_dist and i_initial != nb_forward_points:
+        # CRUISE
+        n_steps_cruise = steps["n_steps_cruise"]
+        n_steps_cruise_climb = steps["n_steps_cruise_climb"]
+        possible_altitudes_cruise_climb = np.linspace(alt_toc, alt_max, num=n_steps_cruise_climb, endpoint=True)
+        
+        # DESCENT
+        n_steps_descent = steps["n_steps_descent"]
+        distance_start_descent = 150 * nm
+        imposed_altitudes_descent_prep = np.array([self.alt_crossover, 10_000, alt_final / ft])
+        
+        ######################### END OF FLIGHT PHASES SETUP ###################################################
+        ########################################################################################################
 
-                local_dist = (
-                    pt[i_initial - 1][half_lateral_points][
-                        half_vertical_points
-                    ].distanceTo(p1)
-                ) / (nb_forward_points - i_initial)
-                dist += local_dist
-                alt += int(local_dist * climbing_ratio)
+        ########################################################################################################
+        ######################### BEGIN OF ALIGNMENT PHASE #####################################################
 
-                for k in range(nb_vertical_points):
-                    bearing = pt[i_initial - 1][half_lateral_points][
-                        k
-                    ].initialBearingTo(p1)
-                    pt[i_initial][half_lateral_points][k] = pt[i_initial - 1][
-                        half_lateral_points
-                    ][k].destination(
-                        local_dist, bearing, min(possible_altitudes[0], alt)
-                    )
-                i_initial += 1
+        # TODO: perform alignment
+        # The goal is to align the heading of the aircraft with the destination in case that the initial heading 
+        # is not the same as the destination. This will be done by adding nodes to the graph that will allow the
+        # aircraft to align its heading with the destination. The aircraft will then follow the path to the destination.
+        # The alignment phase will be done in the following way:
+                # 1. Compute the angle between the initial heading and the destination
+                # 2. Compute the distance to travel to align the heading with the destination
+                # 3. Compute the number of steps to align the heading
+                # 4. Compute the new heading after each step
+                # 5. Compute the new position after each step
+                # 6. Add the new node to the graph
+                # 7. Add the new edge to the graph
 
-        # set last step, descent
-        i_final = 1
-        if descending_ratio != 0:
-            dist = 0
-            alt = p1.height
+        ######################### END OF ALIGNMENT PHASE #######################################################
+        ########################################################################################################
 
-            while dist < descent_dist and i_final != nb_forward_points - 1:
-                local_dist = (
-                    pt[nb_forward_points - i_final][half_lateral_points][
-                        half_vertical_points
-                    ].distanceTo(p0)
-                ) / (nb_forward_points - i_final)
-                dist += local_dist
-                alt += int(local_dist * descending_ratio)
 
-                for k in range(nb_vertical_points):
-                    bearing = pt[nb_forward_points - i_final][half_lateral_points][
-                        k
-                    ].initialBearingTo(p0)
-                    pt[nb_forward_points - i_final - 1][half_lateral_points][k] = pt[
-                        nb_forward_points - i_final
-                    ][half_lateral_points][k].destination(
-                        local_dist, bearing, min(possible_altitudes[0], alt)
-                    )
-                i_final += 1
+        ########################################################################################################
+        ######################### BEGIN OF FLIGHT PHASE ########################################################
 
-        # direct path between end of climbing and beginning of descent
-        for k in range(nb_vertical_points):
-            for i in range(i_initial, nb_forward_points - i_final + 1):
-                bearing = pt[i - 1][half_lateral_points][k].initialBearingTo(p1)
-                total_distance = pt[i - 1][half_lateral_points][k].distanceTo(
-                    pt[nb_forward_points - 2][half_lateral_points][k]
-                )
-                pt[i][half_lateral_points][k] = pt[i - 1][half_lateral_points][
-                    k
-                ].destination(
-                    total_distance / (nb_forward_points - i),
-                    bearing,
-                    height=possible_altitudes[k],
+        branches_ids = {"climb": [], "cruise": [], "cruise_correction": [], "descent": []}
+        for branch_id in range(n_branches):
+            parent_id = 0
+            angle = angles[branch_id]
+            distance_halfway = half_distance / math.cos(math.radians(angle))
+            
+            parent = graph.nodes[parent_id]
+            parent_height = parent["height"]
+
+            ###### CLIMB PHASE ######
+            children_climb = []
+            for index_climb, time_step_climb in enumerate(time_steps_climb):
+                parent = graph.nodes[parent_id]
+                parent_height = parent["height"]
+                plane_heading_branch = aero_bearing(lat1=parent["lat"], lon1=parent["lon"], lat2=lat_end, lon2=lon_end) + angle
+
+                # get the right speed according to the altitude
+                if parent_height / ft < 10_000:
+                    cas_climb = cas_climb1
+                elif parent_height / ft < self.alt_crossover:
+                    cas_climb = cas_climb2
+                else:
+                    cas_climb = mach2cas(mach_climb, parent_height)
+
+                height = possible_altitudes_climb[index_climb+1] * ft
+                dt = time_step_climb
+                dx = cas_climb * dt
+
+                # compute new position
+                lat, lon = latlon(parent["lat"], parent["lon"], d=dx, brg=plane_heading_branch)
+
+                # add the new node
+                graph.add_node(
+                    graph.number_of_nodes(),
+                    node_id=graph.number_of_nodes(),
+                    parent_id=parent_id,
+                    branch_id=branch_id,
+                    lat=lat,
+                    lon=lon,
+                    height=height,
+                    heading=plane_heading_branch,
+                    dist_destination=distance(lat, lon, lat_end, lon_end),
+                    dist_travelled=parent["dist_travelled"] + dx,
+                    ts=parent["ts"] + dt,
+                    phase="climb"
                 )
 
-            bearing = pt[half_forward_points - 1][half_lateral_points][
-                k
-            ].initialBearingTo(pt[half_forward_points + 1][half_lateral_points][k])
-            pt[half_forward_points][nb_lateral_points - 1][k] = pt[half_forward_points][
-                half_lateral_points
-            ][k].destination(
-                distp * half_lateral_points,
-                bearing + 90,
-                height=pt[half_forward_points][half_lateral_points][k].height,
-            )
-            pt[half_forward_points][0][k] = pt[half_forward_points][
-                half_lateral_points
-            ][k].destination(
-                distp * half_lateral_points,
-                bearing - 90,
-                height=pt[half_forward_points][half_lateral_points][k].height,
-            )
+                # add the edge
+                graph.add_edge(parent_id, graph.number_of_nodes()-1)
 
-        for j in range(1, half_lateral_points + 1):
-            for k in range(len(possible_altitudes)):
-                # +j (left)
-                bearing = pt[half_forward_points][half_lateral_points + j - 1][
-                    k
-                ].initialBearingTo(pt[half_forward_points][nb_lateral_points - 1][k])
-                total_distance = pt[half_forward_points][half_lateral_points + j - 1][
-                    k
-                ].distanceTo(pt[half_forward_points][nb_lateral_points - 1][k])
-                pt[half_forward_points][half_lateral_points + j][k] = pt[
-                    half_forward_points
-                ][half_lateral_points + j - 1][k].destination(
-                    total_distance / (half_lateral_points - j + 1),
-                    bearing,
-                    height=pt[half_forward_points][half_lateral_points][k].height,
-                )
-                # -j (right)
-                bearing = pt[half_forward_points][half_lateral_points - j + 1][
-                    k
-                ].initialBearingTo(pt[half_forward_points][0][k])
-                total_distance = pt[half_forward_points][half_lateral_points - j + 1][
-                    k
-                ].distanceTo(pt[half_forward_points][0][k])
-                pt[half_forward_points][half_lateral_points - j][k] = pt[
-                    half_forward_points
-                ][half_lateral_points - j + 1][k].destination(
-                    total_distance / (half_lateral_points - j + 1),
-                    bearing,
-                    height=pt[half_forward_points][half_lateral_points][k].height,
-                )
-                for i in range(1, i_initial):
-                    alt = pt[i][half_lateral_points][k].height
-                    bearing = pt[i - 1][half_lateral_points + j][k].initialBearingTo(
-                        pt[half_forward_points][half_lateral_points + j][k]
-                    )
-                    total_distance = pt[i - 1][half_lateral_points + j][k].distanceTo(
-                        pt[half_forward_points][half_lateral_points + j][k]
-                    )
-                    pt[i][half_lateral_points + j][k] = pt[i - 1][
-                        half_lateral_points + j
-                    ][k].destination(
-                        total_distance / (half_forward_points - i + 1),
-                        bearing,
-                        height=alt,
+                parent_id = graph.number_of_nodes()-1
+
+                children_climb.append(parent_id)
+                
+            branches_ids["climb"].append(children_climb)
+
+            distance_climb_to_destination = graph.nodes[branches_ids["climb"][branch_id][-1]]["dist_destination"]
+            distance_cruise = (distance_climb_to_destination - distance_start_descent)
+            distance_step = distance_cruise / n_steps_cruise
+
+
+            # PREPARING CRUISE, ALTITUDE CHANGES
+            parent_id_after_climb = parent_id
+            parent_ids_after_climb = []
+            # FIRST CRUISE PHASE
+
+            children_cruise = []
+            for step_cruise_climb in range(n_steps_cruise_climb):
+                children_cruise_climb = []
+                plane_heading_branch = plane_heading + angle
+                parent = graph.nodes[parent_id_after_climb]
+                parent_height = parent["height"]
+                target_altitude = possible_altitudes_cruise_climb[step_cruise_climb]
+                plane_heading_branch = aero_bearing(lat1=parent["lat"], lon1=parent["lon"], lat2=lat_end, lon2=lon_end) + angle
+
+                # Allows for a step climb during cruise
+                if parent_height != target_altitude: 
+                    cas_climb = mach2cas(mach_climb, parent_height)
+                    dz_cruise_climb = (target_altitude - parent_height) / ft
+                    dt_cruise_climb = dz_cruise_climb / rocd_climb * 60
+                    dx_cruise_climb = cas_climb * dt_cruise_climb
+
+                    # compute new position
+                    lat, lon = latlon(parent["lat"], parent["lon"], d=dx_cruise_climb, brg=plane_heading_branch)
+
+                    # add the new node
+                    graph.add_node(
+                        graph.number_of_nodes(),
+                        node_id=graph.number_of_nodes(),
+                        parent_id=parent_id,
+                        branch_id=branch_id,
+                        lat=lat,
+                        lon=lon,
+                        height=target_altitude,
+                        heading=plane_heading_branch,
+                        dist_destination=distance(lat, lon, lat_end, lon_end),
+                        dist_travelled=parent["dist_travelled"] + dx_cruise_climb,
+                        ts=parent["ts"] + dt_cruise_climb,
+                        phase="cruise"
                     )
 
-                    bearing = pt[i - 1][half_lateral_points - j][k].initialBearingTo(
-                        pt[half_forward_points][half_lateral_points - j][k]
-                    )
-                    total_distance = pt[i - 1][half_lateral_points - j][k].distanceTo(
-                        pt[half_forward_points][half_lateral_points - j][k]
-                    )
-                    pt[i][half_lateral_points - j][k] = pt[i - 1][
-                        half_lateral_points - j
-                    ][k].destination(
-                        total_distance / (half_forward_points - i + 1),
-                        bearing,
-                        height=alt,
-                    )
-                for i in range(i_initial, half_forward_points):
-                    # first halp (p0 to np2)
-                    bearing = pt[i - 1][half_lateral_points + j][k].initialBearingTo(
-                        pt[half_forward_points][half_lateral_points + j][k]
-                    )
-                    total_distance = pt[i - 1][half_lateral_points + j][k].distanceTo(
-                        pt[half_forward_points][half_lateral_points + j][k]
-                    )
-                    pt[i][half_lateral_points + j][k] = pt[i - 1][
-                        half_lateral_points + j
-                    ][k].destination(
-                        total_distance / (half_forward_points - i + 1),
-                        bearing,
-                        height=pt[i][half_lateral_points][k].height,
+                    parent_id = graph.number_of_nodes()-1
+                    children_cruise_climb.append(parent_id)
+
+                for step_cruise in range(n_steps_cruise):
+                    parent = graph.nodes[parent_id]
+                    parent_distance_travelled = parent["dist_travelled"]
+                    plane_heading_branch = aero_bearing(lat1=parent["lat"], lon1=parent["lon"], lat2=lat_end, lon2=lon_end) + angle
+
+                    if parent_distance_travelled > distance_halfway:
+                        plane_heading_branch = aero_bearing(parent["lat"], parent["lon"], lat_end, lon_end)
+
+                    dx = distance_step
+                    dt = dx / mach2cas(mach_cruise, height)
+
+                    # compute new position
+                    lat, lon = latlon(parent["lat"], parent["lon"], d=dx, brg=plane_heading_branch)
+
+                    # add the new node
+                    graph.add_node(
+                        graph.number_of_nodes(),
+                        node_id=graph.number_of_nodes(),
+                        parent_id=parent_id,
+                        branch_id=branch_id,
+                        lat=lat,
+                        lon=lon,
+                        height=target_altitude,
+                        heading=plane_heading_branch,
+                        dist_destination=distance(lat, lon, lat_end, lon_end),
+                        dist_travelled=parent["dist_travelled"] + dx,
+                        ts=parent["ts"] + dt,
+                        phase="cruise"
                     )
 
-                    bearing = pt[i - 1][half_lateral_points - j][k].initialBearingTo(
-                        pt[half_forward_points][half_lateral_points - j][k]
-                    )
-                    total_distance = pt[i - 1][half_lateral_points - j][k].distanceTo(
-                        pt[half_forward_points][half_lateral_points - j][k]
-                    )
-                    pt[i][half_lateral_points - j][k] = pt[i - 1][
-                        half_lateral_points - j
-                    ][k].destination(
-                        total_distance / (half_forward_points - i + 1),
-                        bearing,
-                        height=pt[i][half_lateral_points][k].height,
-                    )
-                for i in range(1, abs(half_forward_points - i_final)):
-                    # second half (np2 to p1)
-                    bearing = pt[half_forward_points + i - 1][half_lateral_points + j][
-                        k
-                    ].initialBearingTo(
-                        pt[nb_forward_points - 1][half_lateral_points + j][k]
-                    )
-                    total_distance = pt[half_forward_points + i - 1][
-                        half_lateral_points + j
-                    ][k].distanceTo(
-                        pt[nb_forward_points - 1][half_lateral_points + j][k]
-                    )
-                    pt[half_forward_points + i][half_lateral_points + j][k] = pt[
-                        half_forward_points + i - 1
-                    ][half_lateral_points + j][k].destination(
-                        total_distance / (half_forward_points - i + 1),
-                        bearing,
-                        height=pt[half_forward_points + i][half_lateral_points][
-                            k
-                        ].height,
+                    graph.add_edge(parent_id, graph.number_of_nodes()-1)
+
+                    parent_id = graph.number_of_nodes()-1
+
+                    children_cruise_climb.append(parent_id)
+                
+                parent_ids_after_climb.append(parent_id)
+                children_cruise.append(children_cruise_climb)
+            branches_ids["cruise"].append(children_cruise)
+
+            
+            children_cruise_correction = []
+            for parent_group in branches_ids["cruise"][branch_id]:
+                children_cruise_climb_correction = []
+                parent_id_after_first_cruise = parent_group[-1]
+
+                distance_after_cruise = graph.nodes[parent_id_after_first_cruise]["dist_destination"]
+                imposed_descent_prep = np.unique(
+                    np.sort(
+                        np.concatenate(
+                            (
+                                [graph.nodes[parent_id_after_first_cruise]["height"]/ft], 
+                                imposed_altitudes_descent_prep)
+                            )
+                        ))
+                imposed_altitude_descent_diff = np.diff(imposed_descent_prep)
+                cas_descent_profile = [mach2cas(mach_descent, graph.nodes[parent_id_after_first_cruise]["height"]), cas_descent3, cas_descent2, cas_descent1]
+                imposed_times_step_descent = imposed_altitude_descent_diff / rocd_descent * 60
+
+                # compute horizontal distance
+                dx_total = 0
+                for i, time_step_descent in enumerate(imposed_times_step_descent):
+                    dx = cas_descent_profile[i] * time_step_descent
+                    dx_total += dx
+
+                delta_distance_cruise = distance_after_cruise - dx_total
+                # print(f"To destination: {distance_after_cruise/nm}; In descent: {dx_total/nm}; To travel: {delta_distance_cruise/nm}")
+                if delta_distance_cruise < 0:
+                    raise ValueError("With the current ROCD and DESCENT speed profile, the plane cannot reach the destination altitude.")
+                
+                distance_step = delta_distance_cruise / 5
+
+
+                parent_height = graph.nodes[parent_id_after_first_cruise]["height"]
+                parent_id = parent_id_after_first_cruise
+                dx_counter = 0
+                for step_cruise in range(5):
+                    parent = graph.nodes[parent_id]
+                    parent_height = parent["height"]
+                    parent_distance_travelled = parent["dist_travelled"]
+
+                    plane_heading_branch = aero_bearing(parent["lat"], parent["lon"], lat_end, lon_end)
+    
+                    dx = distance_step
+                    dt = dx / mach2cas(mach_cruise, height)
+                    dx_counter += dx
+
+                    # compute new position
+                    lat, lon = latlon(parent["lat"], parent["lon"], d=dx, brg=plane_heading_branch)
+
+                    # add the new node
+                    graph.add_node(
+                        graph.number_of_nodes(),
+                        node_id=graph.number_of_nodes(),
+                        parent_id=parent_id,
+                        branch_id=branch_id,
+                        lat=lat,
+                        lon=lon,
+                        height=parent_height,
+                        heading=plane_heading_branch,
+                        dist_destination=distance(lat, lon, lat_end, lon_end),
+                        dist_travelled=parent["dist_travelled"] + dx,
+                        ts=parent["ts"] + dt,
+                        phase="cruise"
                     )
 
-                    bearing = pt[half_forward_points + i - 1][half_lateral_points - j][
-                        k
-                    ].initialBearingTo(
-                        pt[nb_forward_points - 1][half_lateral_points - j][k]
-                    )
-                    total_distance = pt[half_forward_points + i - 1][
-                        half_lateral_points - j
-                    ][k].distanceTo(
-                        pt[nb_forward_points - 1][half_lateral_points - j][k]
-                    )
-                    pt[half_forward_points + i][half_lateral_points - j][k] = pt[
-                        half_forward_points + i - 1
-                    ][half_lateral_points - j][k].destination(
-                        total_distance / (half_forward_points - i + 1),
-                        bearing,
-                        height=pt[half_forward_points + i][half_lateral_points][
-                            k
-                        ].height,
-                    )
-                for i in range(abs(half_forward_points - i_final), half_forward_points):
-                    alt = pt[half_forward_points + i - 1][half_lateral_points][k].height
-                    bearing = pt[half_forward_points + i - 1][half_lateral_points + j][
-                        k
-                    ].initialBearingTo(
-                        pt[nb_forward_points - 1][half_lateral_points + j][k]
-                    )
-                    total_distance = pt[half_forward_points + i - 1][
-                        half_lateral_points + j
-                    ][k].distanceTo(
-                        pt[nb_forward_points - 1][half_lateral_points + j][k]
-                    )
-                    pt[half_forward_points + i][half_lateral_points + j][k] = pt[
-                        half_forward_points + i - 1
-                    ][half_lateral_points + j][k].destination(
-                        total_distance / (half_forward_points - i + 1),
-                        bearing,
-                        height=alt,
+                    graph.add_edge(parent_id, graph.number_of_nodes()-1)
+
+                    parent_id = graph.number_of_nodes()-1
+
+                    children_cruise_climb_correction.append(parent_id)
+
+                children_cruise_correction.append(children_cruise_climb_correction)
+            branches_ids["cruise_correction"].append(children_cruise_correction)
+            
+            # DESCENT PHASE
+            dx_counter = 0
+            children_descent = []
+            for parent_group in branches_ids["cruise_correction"][branch_id]:
+                children_descent_group = []
+                parent_id_after_cruise_correction = parent_group[-1]
+                parent_height = graph.nodes[parent_id_after_cruise_correction]["height"]
+                parent_id = parent_id_after_cruise_correction
+
+                imposed_altitudes_descent = np.concatenate(([parent_height/ft], imposed_altitudes_descent_prep))
+                possible_altitudes_descent = np.linspace(alt_final, parent_height, num=n_steps_descent, endpoint=True) / ft
+                possible_altitudes_descent = np.unique(np.sort(np.append(possible_altitudes_descent, imposed_altitudes_descent)))[::-1]
+                time_steps_descent = -np.diff(possible_altitudes_descent) / rocd_descent * 60 # seconds
+
+                for index_descent, time_step_descent in enumerate(time_steps_descent):
+                    parent = graph.nodes[parent_id]
+                    parent_height = parent["height"]
+                    plane_heading_branch = aero_bearing(parent["lat"], parent["lon"], lat_end, lon_end)
+
+                    # get the right speed according to the altitude
+                    if parent_height / ft < 10_000:
+                        cas_descent = cas_descent2
+                    elif parent_height / ft <= self.alt_crossover:
+                        cas_descent = cas_descent3
+                    else:
+                        cas_descent = mach2cas(mach_descent, parent_height)
+
+                    height = possible_altitudes_descent[index_descent+1] * ft
+                    dt = time_step_descent
+                    dx = cas_descent * dt
+                    dx_counter += dx
+
+                    # compute new position
+                    lat, lon = latlon(parent["lat"], parent["lon"], d=dx, brg=plane_heading_branch)
+
+                    # add the new node
+                    graph.add_node(
+                        graph.number_of_nodes(),
+                        node_id=graph.number_of_nodes(),
+                        parent_id=parent_id,
+                        branch_id=branch_id,
+                        lat=lat,
+                        lon=lon,
+                        height=height,
+                        heading=plane_heading_branch,
+                        dist_destination=distance(lat, lon, lat_end, lon_end),
+                        dist_travelled=parent["dist_travelled"] + dx,
+                        ts=parent["ts"] + dt,
+                        phase="descent"
                     )
 
-                    bearing = pt[half_forward_points + i - 1][half_lateral_points - j][
-                        k
-                    ].initialBearingTo(
-                        pt[nb_forward_points - 1][half_lateral_points - j][k]
-                    )
-                    total_distance = pt[half_forward_points + i - 1][
-                        half_lateral_points - j
-                    ][k].distanceTo(
-                        pt[nb_forward_points - 1][half_lateral_points - j][k]
-                    )
-                    pt[half_forward_points + i][half_lateral_points - j][k] = pt[
-                        half_forward_points + i - 1
-                    ][half_lateral_points - j][k].destination(
-                        total_distance / (half_forward_points - i + 1),
-                        bearing,
-                        height=alt,
-                    )
+                    # add the edge
+                    graph.add_edge(parent_id, graph.number_of_nodes()-1)
 
-        return pt
+                    parent_id = graph.number_of_nodes()-1
+
+                    children_descent_group.append(parent_id)
+
+                children_descent.append(children_descent_group)
+            # print(f"To destination: {graph.nodes[parent_id]['dist_destination']/nm}")
+            branches_ids["descent"].append(children_descent)
+        self.branches_ids = branches_ids
+
+        ########################################################################################################
+        ######################### START OF NODE CONNECTION #####################################################
+
+        for branch_id in range(n_branches):
+            ### CLIMB PHASE ###
+            # connect to branch on the left
+            if branch_id > 0:
+                for parent_id, child_id in zip(branches_ids["climb"][branch_id][:-1], branches_ids["climb"][branch_id-1]):
+                    graph.add_edge(parent_id, child_id+1)
+
+            # connect to branch on the right
+            if branch_id+1 < n_branches:
+                for parent_id, child_id in zip(branches_ids["climb"][branch_id][:-1], branches_ids["climb"][branch_id+1]):
+                    # print(f"{parent_id} -> {child_id+1}")
+                    graph.add_edge(parent_id, child_id+1)
+
+            parent_climb = branches_ids["climb"][branch_id][-1] # last climb node from the branch
+            for altitude_index in range(n_steps_cruise_climb-1):
+                child_cruise = branches_ids["cruise"][branch_id][altitude_index+1][0] # first cruise node from the branch at altitude above
+                graph.add_edge(parent_climb, child_cruise)
+
+            ### CRUISE + CORRECTION PHASES ###
+            for altitude_index in range(n_steps_cruise_climb):
+                current_altitude_nodes = branches_ids["cruise"][branch_id][altitude_index]
+                
+                ### CRUISE PHASE ###
+                # connect to altitude on bottom
+                if altitude_index > 0:
+                    bottom_altitude_nodes = branches_ids["cruise"][branch_id][altitude_index-1]
+                    for parent_id, child_id in zip(current_altitude_nodes, bottom_altitude_nodes):
+                        if altitude_index - 1 == 0:
+                            # print(f"{parent_id} -> {child_id}")
+                            graph.add_edge(parent_id, child_id)
+                        else:
+                            # print(f"{parent_id} -> {child_id+1}")
+                            graph.add_edge(parent_id, child_id+1)
+                    
+                    # connect to branch on the left
+                    if branch_id > 0:
+                        for parent_id, child_id in zip(current_altitude_nodes, bottom_altitude_nodes):
+                            # print(f"{parent_id} -> {child_id+1}")
+                            graph.add_edge(parent_id, child_id+1)
+
+                    # connect to branch on the right
+                    if branch_id+1 < n_branches:
+                        for parent_id, child_id in zip(current_altitude_nodes, bottom_altitude_nodes):
+                            # print(f"{parent_id} -> {child_id+1}")
+                            graph.add_edge(parent_id, child_id+1)
+
+                # connect to altitude on top
+                if altitude_index+1 < n_steps_cruise_climb:
+                    top_altitude_nodes = branches_ids["cruise"][branch_id][altitude_index+1] if altitude_index+1 < n_steps_cruise_climb else []
+                    for parent_id, child_id in zip(current_altitude_nodes, top_altitude_nodes):
+                        if child_id+1 in top_altitude_nodes:
+                            # print(f"{parent_id} -> {child_id+1}")
+                            graph.add_edge(parent_id, child_id+1)
+                    
+                    # connect to branch on the left
+                    if branch_id > 0:
+                        for parent_id, child_id in zip(current_altitude_nodes, top_altitude_nodes):
+                            # print(f"{parent_id} -> {child_id+1}")
+                            graph.add_edge(parent_id, child_id+1)
+
+                    # connect to branch on the right
+                    if branch_id+1 < n_branches:
+                        for parent_id, child_id in zip(current_altitude_nodes, top_altitude_nodes):
+                            # print(f"{parent_id} -> {child_id+1}")
+                            graph.add_edge(parent_id, child_id+1)
+
+                # connect to branch on the left
+                if branch_id > 0:
+                    for parent_id, child_id in zip(branches_ids["cruise"][branch_id][altitude_index], branches_ids["cruise"][branch_id-1][altitude_index]):
+                        # print(f"{parent_id} -> {child_id+1}")
+                        graph.add_edge(parent_id, child_id+1)
+
+                # connect to branch on the right
+                if branch_id+1 < n_branches:
+                    for parent_id, child_id in zip(branches_ids["cruise"][branch_id][altitude_index], branches_ids["cruise"][branch_id+1][altitude_index]):
+                        # print(f"{parent_id} -> {child_id+1}")
+                        graph.add_edge(parent_id, child_id+1)
+
+                ## CRUISE CORRECTION PHASE ###
+                # connect to altitude on bottom
+                if altitude_index > 0:
+                    for parent_id, child_id in zip(branches_ids["cruise_correction"][branch_id][altitude_index], branches_ids["cruise_correction"][branch_id][altitude_index-1][:-1]):
+                        # print(f"{parent_id} -> {child_id+1}")
+                        graph.add_edge(parent_id, child_id+1)
+
+                # connect to altitude on top
+                if altitude_index+1 < n_steps_cruise_climb:
+                    for parent_id, child_id in zip(branches_ids["cruise_correction"][branch_id][altitude_index], branches_ids["cruise_correction"][branch_id][altitude_index+1][:-1]):
+                        # print(f"{parent_id} -> {child_id+1}")
+                        graph.add_edge(parent_id, child_id+1)
+
+                # connect to branch on the left
+                if branch_id > 0:
+                    for parent_id, child_id in zip(branches_ids["cruise_correction"][branch_id][altitude_index], branches_ids["cruise_correction"][branch_id-1][altitude_index]):
+                        # print(f"{parent_id} -> {child_id+1}")
+                        graph.add_edge(parent_id, child_id+1)
+
+                # connect to branch on the right
+                if branch_id+1 < n_branches:
+                    for parent_id, child_id in zip(branches_ids["cruise_correction"][branch_id][altitude_index], branches_ids["cruise_correction"][branch_id+1][altitude_index]):
+                        # print(f"{parent_id} -> {child_id+1}")
+                        graph.add_edge(parent_id, child_id+1)
+
+                ### DESCENT PHASE ###
+                # connect to to branch on the left
+                if branch_id > 0:
+                    for parent_id, child_id in zip(branches_ids["descent"][branch_id][altitude_index], branches_ids["descent"][branch_id-1][altitude_index][:-1]):
+                        # print(f"{parent_id} -> {child_id+1}")
+                        graph.add_edge(parent_id, child_id+1)
+
+                # connect to branch on the right
+                if branch_id+1 < n_branches:
+                    for parent_id, child_id in zip(branches_ids["descent"][branch_id][altitude_index], branches_ids["descent"][branch_id+1][altitude_index][:-1]):
+                        # print(f"{parent_id} -> {child_id+1}")
+                        graph.add_edge(parent_id, child_id+1)
+
+        ######################### END OF NODE CONNECTION #######################################################
+        ########################################################################################################
+
+        return graph
 
     def get_network(self):
         return self.network
 
     def flying(
-        self, from_: pd.DataFrame, to_: Tuple[float, float, int]
+        self, 
+        from_: pd.DataFrame, 
+        to_: Tuple[float, float, int],
+        phase: str
     ) -> pd.DataFrame:
         """Compute the trajectory of a flying object from a given point to a given point
 
         Args:
             from_ (pd.DataFrame): the trajectory of the object so far
             to_ (Tuple[float, float]): the destination of the object
-
+            phase (str): the phase of the flight
         Returns:
             pd.DataFrame: the final trajectory of the object
         """
         pos = from_.to_dict("records")[0]
+        pos_alt = pos["alt"]
 
         lat_to, lon_to, alt_to = to_[0], to_[1], to_[2]
         dist_ = distance(
             pos["lat"], pos["lon"], lat_to, lon_to, h=(alt_to - pos["alt"]) * ft
         )
+
+        cas = None
+        mach = None
+
+        # determine current CAS/MACH
+        if phase == "climb":
+            if pos_alt < 10_000:
+                cas = min(self.climb_profile["below_10k_ft"], 250) * kts
+            elif pos_alt < self.alt_crossover:
+                cas = self.climb_profile["from_10k_to_crossover"] * kts
+            else:
+                mach = self.climb_profile["above_crossover"]
+        elif phase == "cruise":
+            mach = self.cruise_profile["above_crossover"]
+        elif phase == "descent":
+            if pos_alt < 6_000:
+                cas = min(self.descent_profile["below_10k_ft"], 220) * kts
+            elif pos_alt < 10_000:
+                cas = min(self.descent_profile["below_10k_ft"], 250) * kts
+            elif pos_alt < self.alt_crossover:
+                cas = self.descent_profile["from_10k_to_crossover"] * kts
+            else:
+                mach = self.descent_profile["above_crossover"]
 
         data = []
         epsilon = 100
@@ -1338,7 +1617,10 @@ class FlightPlanningDomain(
 
             wspd = sqrt(wn * wn + we * we)
 
-            tas = mach2tas(self.mach, alt_to * ft)  # alt ft -> meters
+            if mach is not None:
+                tas = mach2tas(mach, alt_to * ft)  # alt ft -> meters
+            else:
+                tas = cas2tas(cas, alt_to * ft)  # alt ft -> meters
 
             gs = compute_gspeed(
                 tas=tas,
@@ -1357,7 +1639,7 @@ class FlightPlanningDomain(
                     pos["lon"],
                     d=gs * dt,
                     brg=bearing_degrees,
-                    h=alt_to * ft,
+                    h=int(alt_to * ft),
                 )
 
             values_current = {
@@ -1387,15 +1669,26 @@ class FlightPlanningDomain(
                     self.weather_date = self.weather_date.previous_day()
                     self.weather_interpolator = self.get_weather_interpolator()
 
-            new_row = {
-                "ts": (pos["ts"] + dt),
-                "lat": ll[0],
-                "lon": ll[1],
-                "mass": mass,
-                "mach": self.mach,
-                "fuel": pos["fuel"],
-                "alt": alt_to,  # to be modified
-            }
+            if mach is not None:
+                new_row = {
+                    "ts": (pos["ts"] + dt),
+                    "lat": ll[0],
+                    "lon": ll[1],
+                    "mass": mass,
+                    "cas_mach": mach,
+                    "fuel": pos["fuel"],
+                    "alt": alt_to,  # to be modified
+                }
+            if cas is not None:
+                new_row = {
+                    "ts": (pos["ts"] + dt),
+                    "lat": ll[0],
+                    "lon": ll[1],
+                    "mass": mass,
+                    "cas_mach": cas / kts,
+                    "fuel": pos["fuel"],
+                    "alt": alt_to,  # to be modified
+                }
 
             dist = distance(
                 ll[0],
@@ -1419,7 +1712,7 @@ class FlightPlanningDomain(
 
         return pd.DataFrame(data)
 
-    def get_weather_interpolator(self) -> GenericWindInterpolator:
+    def get_weather_interpolator(self) -> Optional[GenericWindInterpolator]:
         weather_interpolator = None
 
         if self.weather_date:
@@ -1455,13 +1748,12 @@ class FlightPlanningDomain(
             outcome = self.step(action)
             observation = outcome.observation
 
-            # self.observation = observation
 
             print("step ", i_step)
             print("policy = ", action[0], action[1])
-            print("New state = ", observation.pos)
+            print("New node id = ", observation.id)
             print("Alt = ", observation.alt)
-            print("Mach = ", observation.trajectory.iloc[-1]["mach"])
+            print("Cas/Mach = ", observation.trajectory.iloc[-1]["cas_mach"])
             print(observation)
 
             # if make_img:
@@ -1478,21 +1770,10 @@ class FlightPlanningDomain(
             print("Final state reached")
             clear_output(wait=True)
             fig = plot_full(self, observation.trajectory)
-            # plt.savefig(f"full_plot")
+            plt.savefig(f"full_plot")
             plt.show()
+            self.observation = observation
             pass
-            # clear_output(wait=True)
-            # plt.title(f'Flight plan - {self.origin} -> {self.destination} \n Model: {self.perf_model_name}, Fuel: {np.round(observation.trajectory["fuel"].sum(), 2)} Kg')
-            # plt.savefig(f"terminal")
-            # plt.show()
-
-            # figure = plot_altitude(observation.trajectory)
-            # plt.savefig("altitude")
-            # plt.show()
-            # figure = plot_mass(observation.trajectory)
-            # plt.savefig("mass")
-            # plt.show()
-            # plot_network(self)
         # goal reached?
         is_goal_reached = self.is_goal(observation)
 
@@ -1501,7 +1782,7 @@ class FlightPlanningDomain(
             if self.constraints is not None:
                 if self.constraints["time"] is not None:
                     if (
-                        self.constraints["time"][1]
+                        self.constraints["time"][1] # type: ignore
                         >= terminal_state_constraints["time"]
                     ):
                         if (
@@ -1567,12 +1848,12 @@ def compute_gspeed(
         error = ""
     return gs
 
-
+# TODO: modify the function
 def fuel_optimisation(
     origin: Union[str, tuple],
     destination: Union[str, tuple],
     actype: str,
-    constraints: dict,
+    constraints: Optional[Dict[str, float]],
     weather_date: WeatherDate,
     solver_factory: Callable[[], Solver],
     max_steps: int = 100,
@@ -1589,7 +1870,7 @@ def fuel_optimisation(
             ICAO code of the arrival airport of th flight plan e.g LFBO for Toulouse-Blagnac airport, or a tuple (lat,lon)
 
         actype (str):
-            Aircarft type describe in openap datas (https://github.com/junzis/openap/tree/master/openap/data/aircraft)
+            Aircraft type describe in openap datas (https://github.com/junzis/openap/tree/master/openap/data/aircraft)
 
         constraints (dict):
             Constraints that will be defined for the flight plan
@@ -1616,6 +1897,7 @@ def fuel_optimisation(
 
     small_diff = False
     step = 0
+
     new_fuel = constraints["fuel"]
     while not small_diff:
         domain_factory = lambda: FlightPlanningDomain(
@@ -1626,8 +1908,6 @@ def fuel_optimisation(
             weather_date=weather_date,
             objective="distance",
             heuristic_name="distance",
-            nb_forward_points=41,
-            nb_lateral_points=11,
             fuel_loaded=new_fuel,
             starting_time=0.0,
         )

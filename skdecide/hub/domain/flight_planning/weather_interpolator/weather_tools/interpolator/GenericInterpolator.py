@@ -1,6 +1,6 @@
 import os
 from abc import ABC, abstractmethod
-from typing import Union
+from typing import Union, List
 
 import cartopy.crs as ccrs
 import matplotlib.pyplot as plt
@@ -518,7 +518,7 @@ class GenericWindInterpolator(GenericEnsembleInterpolator, WeatherInterpolator):
     def transform_long(self, long):
         return long
 
-    def interpol_wind_classic(self, lat, longi, alt=35000.0, t=0.0, index_forecast=0):
+    def interpol_wind_classic(self, lat, longi, alt=35000.0, t=0.0, index_forecast=0) -> List[List[float]]:
         # with self._auto_lock:
         p = std_atm.alt2press(alt, alt_units="ft", press_units="hpa")
 
@@ -537,6 +537,8 @@ class GenericWindInterpolator(GenericEnsembleInterpolator, WeatherInterpolator):
 
             result = norm * np.array([np.cos(arg), np.sin(arg)])
             return [norm, arg, result]
+        
+        return [[], [], []]
 
     def interpol_wind(self, X):
         """
