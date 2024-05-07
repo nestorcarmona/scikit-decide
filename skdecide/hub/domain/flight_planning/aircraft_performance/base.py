@@ -20,13 +20,12 @@ from skdecide.hub.domain.flight_planning.aircraft_performance.poll_schumann_util
 
 
 class AircraftPerformanceModel:
-    def __init__(self, actype: str, perf_model: str = None):
+    def __init__(self, actype: str, perf_model: str = "openap"):
         self.perf_model_name = perf_model
 
         if perf_model == "openap":
             self.perf_model = OpenAP(actype)
         elif perf_model == "PS":
-            print("Poll-Schumann model")
             self.perf_model = PollSchumannModel(actype)
         else:
             raise ValueError(f"Unknown performance model: {perf_model}")
@@ -56,7 +55,7 @@ class OpenAP(AircraftPerformanceModel):
         self,
         values_current: Dict[str, float],
         delta_time: float,
-        path_angle: Optional[float] = 0.0,
+        path_angle: int = 0,
     ) -> float:
 
         mass_current, altitude_current, speed_current = (

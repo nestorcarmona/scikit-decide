@@ -296,80 +296,91 @@ def plot_network(domain, dir=None):
     origin_coord = domain.lat1, domain.lon1, domain.alt1
     target_coord = domain.lat2, domain.lon2, domain.alt2
 
-    # fig, ax = plt.subplots(1, subplot_kw={"projection": ccrs.PlateCarree()})
     fig = plt.figure(figsize=(15, 10))
 
     # define the grid layout
-    gs = gridspec.GridSpec(1, 2, width_ratios=[1, 1])
-    ax1 = fig.add_subplot(gs[0], projection=ccrs.PlateCarree())
-    ax2 = fig.add_subplot(gs[1])
+    gs = gridspec.GridSpec(1, 2)
 
-    ax1.set_extent(
+    # add subplots for the line plots
+    ax1 = fig.add_subplot(gs[0])
+
+
+    # plot the altitude
+    for node in network.nodes:
+        ax1.scatter(
+            network.nodes[node]["dist_destination"] / nm,
+            network.nodes[node]["height"] / ft,
+            color='k',
+            s=0.5
+        )
+
+    # # plot edges in altitude
+    # for edge in network.edges:
+    #     ax1.plot(
+    #         [
+    #             network.nodes[edge[0]]["dist_destination"] / nm,
+    #             network.nodes[edge[1]]["dist_destination"] / nm
+    #         ],
+    #         [
+    #             network.nodes[edge[0]]["height"] / ft,
+    #             network.nodes[edge[1]]["height"] / ft
+    #         ],
+    #         color='k',
+    #         lw=0.5
+    #     )
+
+    ax1.set_xlabel("Distance to destination (nm)")
+    ax1.set_ylabel("Zp (ft)")
+    ax1.set_title("Altitude profile")
+
+    # plot the trajectory
+    latmin, latmax = min(domain.lat1, domain.lat2), max(domain.lat1, domain.lat2)
+    lonmin, lonmax = min(domain.lon1, domain.lon2), max(domain.lon1, domain.lon2)
+
+    ax3 = fig.add_subplot(
+        gs[1], 
+        projection=ccrs.PlateCarree()
+    )
+
+    ax3.set_extent(
         [
-            min(origin_coord[1], target_coord[1]) - 4,
-            max(origin_coord[1], target_coord[1]) + 4,
-            min(origin_coord[0], target_coord[0]) - 2,
-            max(origin_coord[0], target_coord[0]) + 2,
+            lonmin - 3, 
+            lonmax + 3, 
+            latmin - 2, 
+            latmax + 2
         ]
     )
-    ax1.add_feature(OCEAN, facecolor="#d1e0e0", zorder=-1, lw=0)
-    ax1.add_feature(LAND, facecolor="#f5f5f5", lw=0)
-    ax1.add_feature(BORDERS, lw=0.5, color="gray")
-    ax1.gridlines(draw_labels=True, color="gray", alpha=0.5, ls="--")
-    ax1.coastlines(resolution="50m", lw=0.5, color="gray")
+    
+    ax3.add_feature(BORDERS, lw=0.5, color="gray")
+    ax3.gridlines(draw_labels=True, color="gray", alpha=0.5, ls="--")
+    ax3.coastlines(resolution="50m", lw=0.5, color="gray")
 
-    lon_values = [
-        network[x][x1][x2].lon
-        for x in range(len(network))
-        for x1 in range(len(network[x]))
-        for x2 in range(len(network[x][x1]))
-    ]
-    lat_values = [
-        network[x][x1][x2].lat
-        for x in range(len(network))
-        for x1 in range(len(network[x]))
-        for x2 in range(len(network[x][x1]))
-    ]
-    height_values = [
-        network[x][x1][x2].height / ft
-        for x in range(len(network))
-        for x1 in range(len(network[x]))
-        for x2 in range(len(network[x][x1]))
-    ]
-    distance_to_origin = [
-        LatLon(lat_values[i], lon_values[i], height_values[i]).distanceTo(
-            LatLon(origin_coord[0], origin_coord[1], origin_coord[2])
+    for node in network.nodes:
+        ax3.scatter(
+            network.nodes[node]["lon"],
+            network.nodes[node]["lat"],
+            transform=ccrs.Geodetic(),
+            color='blue',
+            s=1
         )
-        / nm
-        for i in range(len(lon_values))
-    ]
 
-    ax1.scatter(
-        lon_values,
-        lat_values,
-        # transform=ccrs.Geodetic(),
-        s=0.2,
-    )
+        
 
-    ax2.scatter(
-        distance_to_origin,
-        height_values,
-        s=0.2,
-    )
+    # plot the edges
+    for edge in network.edges:
+        # print(f"{edge[0]} -> {edge[1]}")
+        ax3.plot(
+            [network.nodes[edge[0]]["lon"], network.nodes[edge[1]]["lon"]],
+            [network.nodes[edge[0]]["lat"], network.nodes[edge[1]]["lat"]],
+            transform=ccrs.Geodetic(),
+            color='black',
+            lw=0.5
+        )
 
-    # scatter airports
-    ax1.scatter(
-        origin_coord[1],
-        origin_coord[0],
-        c="darkgreen",
-        transform=ccrs.Geodetic(),
-        alpha=0.3,
-    )
-    ax1.scatter(
-        target_coord[1], target_coord[0], c="red", transform=ccrs.Geodetic(), alpha=0.3
-    )
+
 
     plt.tight_layout()
+
     plt.show()
 
     if dir:

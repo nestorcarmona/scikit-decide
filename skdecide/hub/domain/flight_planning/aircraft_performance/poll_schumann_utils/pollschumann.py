@@ -54,7 +54,7 @@ class FuelFlow:
         self,
         values_current: Dict[str, float],
         delta_time: float,
-        path_angle: Optional[float] = 0.0,
+        path_angle: int = 0,
     ) -> float:
 
         """Compute fuel flow based on Poll-Schumann model.
@@ -64,8 +64,8 @@ class FuelFlow:
                 Dictionary with current values of altitude [:math:`ft`], speed [:math:`kts`], temperature [:math:`K`], and mass [:math:`Kg`].
             delta_time (float):
                 Time step in seconds [:math:`s`].
-            path_angle (Optional[float], optional):
-                Path angle. Defaults to 0.0 degrees.
+            path_angle (int):
+                Path angle. Defaults to 0 degrees.
 
         Returns:
             float: Fuel flow, [:math:`Kg/s`].
@@ -110,7 +110,7 @@ class FuelFlow:
 
         # Rate Of Climb and Descent; path angle; acceleration
         rocd = jet.rate_of_climb_descent(altitude_current, altitude_next, delta_time)
-        path_angle = math.degrees(
+        path_angle_comp = math.degrees(
             (altitude_next - altitude_current) * ft / (true_airspeed * delta_time)
         )  # approximation for small angles
 
@@ -123,7 +123,7 @@ class FuelFlow:
             air_pressure,
             air_temperature,
             mach_num,
-            path_angle,
+            path_angle_comp,
         )
         c_f = atm_params.skin_friction_coefficient(reynolds)
         c_drag_0 = atm_params.zero_lift_drag_coefficient(
