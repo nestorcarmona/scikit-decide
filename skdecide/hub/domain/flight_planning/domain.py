@@ -385,7 +385,7 @@ class FlightPlanningDomain(
         constraints: Optional[Dict[str, float]] = None,
         climb_profile: Dict[str, float] = {"below_10k_ft": 250., "from_10k_to_crossover": 270., "above_crossover": 0.78},
         cruise_profile: Dict[str, float] = {"above_crossover": 0.83},
-        descent_profile: Dict[str, float] = {"below_10k_ft": 280., "from_10k_to_crossover": 280., "above_crossover": 0.8},
+        descent_profile: Dict[str, float] = {"below_10k_ft": 260., "from_10k_to_crossover": 280., "above_crossover": 0.78},
         rate_of_climb_descent: Dict[str, float] = {"climb": 1_500.0, "descent": 2_000.0},
         steps: Dict[str, int] = {"n_steps_climb": 1, "n_steps_cruise": 10, "n_steps_cruise_climb": 1, "n_steps_descent": 1},
         n_branches: int = 3,
@@ -1724,9 +1724,9 @@ class FlightPlanningDomain(
 
     def custom_rollout(self, solver, max_steps=100, make_img=True):
         observation = self.reset()
-
+        print(f"Initial observation: {observation}")
         solver.reset()
-        clear_output(wait=True)
+        # clear_output(wait=True)
 
         # loop until max_steps or goal is reached
         for i_step in range(1, max_steps + 1):
@@ -1758,11 +1758,10 @@ class FlightPlanningDomain(
                 break
         if make_img:
             print("Final state reached")
-            clear_output(wait=True)
+            # clear_output(wait=True)
             fig = plot_full(self, observation.trajectory)
             plt.savefig(f"full_plot")
             plt.show()
-            self.observation = observation
             pass
         # goal reached?
         is_goal_reached = self.is_goal(observation)
@@ -1804,7 +1803,7 @@ class FlightPlanningDomain(
                     )
         else:
             print(f"Goal not reached after {i_step} steps!")
-
+        self.observation = observation
         return terminal_state_constraints, self.constraints
 
 
